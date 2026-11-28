@@ -77,6 +77,12 @@ var (
 // after it started. Retry later at the same protocol version.
 var errCacheNotReady = errors.New("cache has no data available yet")
 
+// CacheNotReady reports whether err, as the SetOnSessionEnd callback gets
+// it, is a session the cache ended with Error Report code 2 (No Data
+// Available). The client logs that below the warning level, as it is not a
+// fault, so a caller that shows warnings only has nothing to show for it.
+func CacheNotReady(err error) bool { return errors.Is(err, errCacheNotReady) }
+
 // errVersionUpgrade ends a downgraded session after a re-probe found that the
 // cache now supports the configured version.
 var errVersionUpgrade = errors.New("cache now supports a higher RTR protocol version")

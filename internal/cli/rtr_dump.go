@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -36,17 +37,27 @@ var progressEvery = 10 * time.Second
 // A cache that cannot be reached at all (the first dial fails) ends it at
 // once with the dial's error; once a session has connected, one that drops
 // before the End of Data is tried again until ctx ends. progress, if not
-// nil, gets a line when the cache answers and then every progressEvery
-// with the records received so far, so that a slow transfer can be told
-// from a hang.
+// nil, gets a line when the cache answers and then, while that session is
+// open, every progressEvery with the records received so far, so that a
+// slow transfer can be told from a hang. A cache that has no data yet (No
+// Data Available) gets a line saying so each time it ends a session: the
+// client logs every other end with its error at the warning level or above.
 func takeRTRSnapshot(ctx context.Context, client *rtr.Client, cache string, vrps *store.VRPStore,
 	aspas *store.ASPAStore, now func() time.Time, progress io.Writer) (*rtrSnapshot, error) {
 	ctx, cancel := context.WithCancelCause(ctx)
 
-	connected := false // owned by the goroutine running Start
+	if progress != nil {
+		progress = &lockedWriter{w: progress}
+	}
+	connected := false   // owned by the goroutine running Start
+	var open atomic.Bool // a session is open: the cache has answered in it
 	client.SetOnSessionEnd(func(err error, dialed bool) {
+		open.Store(false)
 		if dialed {
 			connected = true
+			if progress != nil && rtr.CacheNotReady(err) {
+				fmt.Fprintf(progress, "%s: session ended before End of Data: %v; trying again\n", cache, err)
+			}
 			return
 		}
 		if !connected {
@@ -56,8 +67,8 @@ func takeRTRSnapshot(ctx context.Context, client *rtr.Client, cache string, vrps
 	var wg sync.WaitGroup
 	defer func() { cancel(nil); wg.Wait() }() // no progress line once this returns
 	if progress != nil {
-		progress = &lockedWriter{w: progress}
 		client.SetOnEstablished(func(version uint8) {
+			open.Store(true)
 			fmt.Fprintf(progress, "%s: session open at RTR version %d, waiting for the first End of Data\n", cache, version)
 		})
 		wg.Add(1)
@@ -70,7 +81,11 @@ func takeRTRSnapshot(ctx context.Context, client *rtr.Client, cache string, vrps
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					fmt.Fprintf(progress, "%s: %d records received so far\n", cache, client.RecordsReceived())
+					// No count before a session opens or between two:
+					// there is no transfer to report on.
+					if open.Load() {
+						fmt.Fprintf(progress, "%s: %d records received so far\n", cache, client.RecordsReceived())
+					}
 				}
 			}
 		}()

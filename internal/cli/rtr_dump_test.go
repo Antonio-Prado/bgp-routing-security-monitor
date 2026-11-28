@@ -2,7 +2,10 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -12,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nokia-steward/bgp-routing-security-monitor/internal/rtr/rtrtest"
+	"github.com/nokia-steward/bgp-routing-security-monitor/internal/rtr/store"
 )
 
 type dumpDoc struct {
@@ -182,5 +186,112 @@ func TestRTRDumpProgress(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "session open at RTR version 2") || !strings.Contains(errOut, "2 records received so far") {
 		t.Fatalf("progress: %q", errOut)
+	}
+}
+
+// A cache that is still building its data answers every query with No Data
+// Available. Until a session opens the dump prints no count of records, and
+// each of those sessions gets a line with why it ended.
+func TestRTRDumpCacheNotReady(t *testing.T) {
+	old := progressEvery
+	progressEvery = 20 * time.Millisecond
+	t.Cleanup(func() { progressEvery = old })
+
+	cache := rtrtest.NewCache(t)
+	go func() {
+		for range 2 {
+			q := cache.Next(5 * time.Second)
+			q.Conn.Send(rtrtest.ErrorReport(2, 2, "Running initial validation"))
+		}
+		q := cache.Next(5 * time.Second)
+		q.Conn.Send(
+			rtrtest.CacheResponse(2, 9),
+			rtrtest.IPv4Prefix(2, true, netip.MustParsePrefix("192.0.2.0/24"), 24, 64500),
+		)
+		time.Sleep(200 * time.Millisecond) // a slow transfer
+		q.Conn.Send(rtrtest.EndOfData(2, 9, 1, 3600, 600, 7200))
+	}()
+
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	vrps, aspas := store.NewVRPStore(), store.NewASPAStore()
+	client, err := newMonitorClientStores(cache.Addr(), "tcp", "auto", vrps, aspas, nil, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Several ticks of progressEvery pass between two sessions.
+	client.SetReconnectBackoff(150*time.Millisecond, 150*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var progress bytes.Buffer
+	snap, err := takeRTRSnapshot(ctx, client, cache.Addr(), vrps, aspas, time.Now, &progress)
+	if err != nil {
+		t.Fatalf("dump: %v\n%s", err, progress.String())
+	}
+	if len(snap.vrps) != 1 {
+		t.Fatalf("got %d VRPs, want 1", len(snap.vrps))
+	}
+
+	out := progress.String()
+	ended := cache.Addr() + ": session ended before End of Data: cache has no data available yet (Running initial validation); trying again\n"
+	if n := strings.Count(out, ended); n != 2 {
+		t.Fatalf("want the reason of both sessions that ended early, got %d:\n%s", n, out)
+	}
+	opened := strings.Index(out, "session open at RTR version 2")
+	if opened < 0 {
+		t.Fatalf("no line for the session that opened:\n%s", out)
+	}
+	if strings.Contains(out[:opened], "records received so far") {
+		t.Fatalf("a count of records before any session opened:\n%s", out)
+	}
+	if !strings.Contains(out[opened:], "1 records received so far") {
+		t.Fatalf("no count of records while the session was open:\n%s", out)
+	}
+}
+
+// A session that ends early for any other reason is on stderr already: the
+// client logs it as an error, with what ended it, and the dump adds no line
+// of its own.
+func TestRTRDumpDroppedSessionIsLoggedOnce(t *testing.T) {
+	cache := rtrtest.NewCache(t)
+	go func() {
+		q := cache.Next(5 * time.Second)
+		q.Conn.Send(
+			rtrtest.CacheResponse(2, 9),
+			rtrtest.IPv4Prefix(2, true, netip.MustParsePrefix("192.0.2.0/24"), 24, 64500),
+		)
+		q.Conn.Close() // dropped in the middle of the transfer
+		q = cache.Next(5 * time.Second)
+		q.Conn.Send(
+			rtrtest.CacheResponse(2, 9),
+			rtrtest.IPv4Prefix(2, true, netip.MustParsePrefix("192.0.2.0/24"), 24, 64500),
+			rtrtest.EndOfData(2, 9, 1, 3600, 600, 7200),
+		)
+	}()
+
+	// Standard error as the command sets it up: the client's log from the
+	// warning level, and the dump's own lines.
+	stderr := &lockedBuffer{}
+	log := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	vrps, aspas := store.NewVRPStore(), store.NewASPAStore()
+	client, err := newMonitorClientStores(cache.Addr(), "tcp", "auto", vrps, aspas, nil, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetReconnectBackoff(50*time.Millisecond, 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := takeRTRSnapshot(ctx, client, cache.Addr(), vrps, aspas, time.Now, stderr); err != nil {
+		t.Fatalf("dump: %v\n%s", err, stderr.String())
+	}
+
+	out := stderr.String()
+	if n := strings.Count(out, `level=ERROR msg="RTR session failed, reconnecting"`); n != 1 {
+		t.Fatalf("want the client's error line for the dropped session once, got %d:\n%s", n, out)
+	}
+	if strings.Contains(out, "session ended before End of Data") {
+		t.Fatalf("the dump repeated what the client had logged:\n%s", out)
+	}
+	if n := strings.Count(out, "session open at RTR version 2"); n != 2 {
+		t.Fatalf("want a line for each of the two sessions that opened, got %d:\n%s", n, out)
 	}
 }

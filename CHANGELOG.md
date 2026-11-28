@@ -8,6 +8,11 @@ All notable changes to RAVEN are recorded here.
 - `raven rtr dump` writes the VRPs and ASPAs that an RTR cache serves at its first complete sync as JSON, in the layout of Routinator's `json` output, sorted and without duplicates, so that two caches compare with a plain diff. The metadata has the cache, the session ID, the serial, the RTR version, the time and the `data_fingerprint` of the monitor's telemetry; below RTR version 2 the `aspas` list is left out and the metadata says that ASPAs were unavailable.
 
 ### Changed
+- `raven rtr dump` counts the records received, on standard error, only
+  while a session is open, and says why a session ended when the cache has
+  no data yet (Error Report 2, No Data Available). Against a cache that was
+  still validating it used to print `0 records received so far` every 10
+  seconds, with no session open and no reason given.
 - The docs give the ASPA setup for both Routinator versions: 0.16 and
   later serve ASPA by default (`--disable-aspa` or `enable-aspa = false`
   turns it off), and 0.15.x and older need `--enable-aspa` or

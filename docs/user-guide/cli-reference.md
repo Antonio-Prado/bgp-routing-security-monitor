@@ -1655,3 +1655,15 @@ A summary goes to standard error:
 rtr1.example.net:3323: session 60474, serial 590, RTR version 2, 1039199 VRPs, 4308 ASPAs
 ```
 
+Before it, standard error has a line when the session opens and then, every
+10 seconds while it is open, the count of records received so far: a slow
+transfer does not look like a hang. A cache that is still building its data
+answers with No Data Available (Error Report 2) and ends the session; the
+dump says so and tries again until `--timeout`:
+
+```text
+rtr1.example.net:3323: session ended before End of Data: cache has no data available yet (Running initial validation); trying again
+rtr1.example.net:3323: session open at RTR version 2, waiting for the first End of Data
+rtr1.example.net:3323: 412300 records received so far
+```
+
