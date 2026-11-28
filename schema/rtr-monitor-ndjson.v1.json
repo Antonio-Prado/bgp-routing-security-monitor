@@ -945,6 +945,10 @@
             "type": "string"
           },
           "description": "When counts has a split kind: the caches on the other side of the split items."
+        },
+        "items_file": {
+          "type": "string",
+          "description": "With --divergence-dir: the name of the file in that directory that lists every difference attributed to the cache, settled or still settling, where samples has at most 20. A file name, not a path."
         }
       },
       "required": [

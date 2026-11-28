@@ -495,6 +495,7 @@ A cache's first persistent difference settled: a divergence episode began.
 | `counts` | object | always | Persistent differences attributed to this cache, by [kind](#divergence-kind); only kinds with at least one |
 | `samples` | array of objects | always | Up to 20 of those differences, taken from each kind in turn, sorted by kind and item (below) |
 | `split_with` | array of strings | with a split kind | The caches on the other side of the split items |
+| `items_file` | string | with `--divergence-dir` | The name of the file in that directory that lists every difference attributed to this cache, where `samples` has at most 20: see [Divergence files](#divergence-files). A file name, not a path. Absent when the list could not be queued for writing |
 
 Each sample:
 
@@ -533,6 +534,89 @@ compared caches on anything.
 ```json
 {"timestamp":"2026-11-12T03:34:36.875279716Z","cache":"rtr-b.example.net:3323","event_type":"divergence_resolved","schema_version":1,"episode":1,"started_at":"2026-11-12T03:34:35.957205531Z","duration_ns":918074185,"compared":["rtr-a.example.net:3323","rtr-b.example.net:3323","rtr-c.example.net:3323"]}
 ```
+
+### Divergence files
+
+A `divergence` record names at most 20 items, only those that had settled
+when the episode opened, and is written once per episode: an item that
+starts to differ later is counted in the gauges and never named. With
+`--divergence-dir` the monitor writes the full list to a file in that
+directory, outside this stream, so that a large incident does not put a
+line of many megabytes into a stream other tools parse. The files are not
+part of the NDJSON contract and have no `schema_version`; their items are
+in the format of the `divergence` samples.
+
+A file is written for a cache:
+
+- when its divergence episode opens (`reason` `divergence`); the
+  `divergence` record carries the file's name as `items_file`;
+- when it returns to earlier data (`reason` `data_regressed`), with what it
+  disagrees with the other caches on as of that sync;
+- on SIGUSR1 (`reason` `signal`): one file for every compared cache, also
+  for a cache with no difference, whose list is empty.
+
+The name is `<cache>-<time>-<reason>.json`: the cache as given to `--cache`
+with every character other than letters, digits, `.` and `-` replaced by
+`_` (`rtr-c.example.net_3323`), and the time the list was made at, in UTC
+to the second (`20261112T033436Z`). A file is written under a temporary
+name and renamed when it is whole. One that cannot be written (a full
+disk, a missing directory) is logged as a warning and the monitor goes on.
+
+```json
+{
+  "metadata": {
+    "generated": "2026-11-12T03:34:36.860743886Z",
+    "reason": "divergence",
+    "cache": "rtr-c.example.net:3323",
+    "episode": 1,
+    "started_at": "2026-11-12T03:14:35.957205531Z",
+    "compared": [
+      "rtr-a.example.net:3323",
+      "rtr-b.example.net:3323",
+      "rtr-c.example.net:3323"
+    ],
+    "settle_ns": 1200000000000,
+    "counts": {
+      "vrp_missing": 2
+    },
+    "settling": {
+      "aspa_mismatch": 1
+    },
+    "items": 3
+  },
+  "items": [
+    {"kind":"vrp_missing","prefix":"192.0.2.0/24","max_length":24,"asn":64500,"agree":["rtr-c.example.net:3323"],"disagree":["rtr-a.example.net:3323","rtr-b.example.net:3323"],"first_seen":"2026-11-12T03:14:35.957205531Z","settled":true},
+    {"kind":"vrp_missing","prefix":"198.51.100.0/24","max_length":24,"asn":64500,"agree":["rtr-c.example.net:3323"],"disagree":["rtr-a.example.net:3323","rtr-b.example.net:3323"],"first_seen":"2026-11-12T03:14:35.957205531Z","settled":true},
+    {"kind":"aspa_mismatch","customer_asn":64511,"providers":[64501],"majority_providers":[64501,64502],"agree":["rtr-c.example.net:3323"],"disagree":["rtr-a.example.net:3323","rtr-b.example.net:3323"],"first_seen":"2026-11-12T03:31:02.118402774Z","settled":false}
+  ]
+}
+```
+
+| Member of `metadata` | Type | Presence | Meaning |
+|---|---|---|---|
+| `generated` | string | always | When the list was made (RFC 3339, UTC) |
+| `reason` | string | always | `divergence`, `data_regressed` or `signal` |
+| `cache` | string | always | The cache the differences are attributed to, as given to `--cache` |
+| `episode` | integer | while the cache has an episode open | The episode's number, as in its `divergence` record |
+| `started_at` | string | with `episode` | The episode's `started_at` |
+| `compared` | array of strings | always | The caches compared, in `--cache` order |
+| `settle_ns` | integer | always | The settle window in effect, in nanoseconds |
+| `counts` | object | always | The settled differences, by [kind](#divergence-kind): what a `divergence` record written at that moment would count |
+| `settling` | object | always | The differences still inside the settle window, by kind |
+| `items` | integer | always | The number of items that follow: a file with fewer was cut |
+
+`items` holds one item a line, sorted by kind and then by VRP or customer
+AS, as the samples are. Each is a [sample](#divergence) with two more
+members:
+
+| Field | Type | Presence | Meaning |
+|---|---|---|---|
+| `first_seen` | string | always | When the difference was first seen in its present shape: the same compared caches, the same holders (RFC 3339, UTC) |
+| `settled` | boolean | always | Whether it has lasted longer than the settle window |
+
+At 1M VRPs a cache that lost every record of one Trust Anchor differs on a
+few hundred thousand items: a file of that size is some tens of megabytes.
+The monitor never removes the files.
 
 ### `upstream_change`
 

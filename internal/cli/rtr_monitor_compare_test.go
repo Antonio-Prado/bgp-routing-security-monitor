@@ -36,6 +36,14 @@ type compareRun struct {
 // --compare-settle settle.
 func runCompare(t *testing.T, srvs []*rtrtest.Server, settle time.Duration, detector *telemetry.Detector) *compareRun {
 	t.Helper()
+	return runCompareWith(t, srvs, settle, detector, nil)
+}
+
+// runCompareWith is runCompare with configure, if not nil, run on the set
+// before its clients start (--divergence-dir, say).
+func runCompareWith(t *testing.T, srvs []*rtrtest.Server, settle time.Duration, detector *telemetry.Detector,
+	configure func(*monitorSet)) *compareRun {
+	t.Helper()
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
 	m := &monitorRun{ndjson: &lockedBuffer{}}
 	rec := telemetry.NewRecorder(m.ndjson, 256, quiet)
@@ -49,6 +57,9 @@ func runCompare(t *testing.T, srvs []*rtrtest.Server, settle time.Duration, dete
 	}
 	for _, c := range caches {
 		initAnomalyMetrics(c)
+	}
+	if configure != nil {
+		configure(set)
 	}
 	consumed := make(chan struct{})
 	go func() {

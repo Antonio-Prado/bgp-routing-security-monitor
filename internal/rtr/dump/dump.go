@@ -66,13 +66,13 @@ func Write(w io.Writer, md Metadata, vrps []types.VRP, aspas []types.ASPARecord)
 	}
 	fmt.Fprintf(bw, "  },\n")
 
-	writeList(bw, "roas", len(vrps), !md.ASPAAvailable(), func(i int) string {
+	WriteList(bw, "roas", len(vrps), !md.ASPAAvailable(), func(i int) string {
 		v := vrps[i]
 		return fmt.Sprintf(`{ "asn": "AS%d", "prefix": "%s", "maxLength": %d }`, v.ASN, v.Prefix, v.MaxLength)
 	})
 	if md.ASPAAvailable() {
 		recs := SortASPAs(aspas)
-		writeList(bw, "aspas", len(recs), true, func(i int) string {
+		WriteList(bw, "aspas", len(recs), true, func(i int) string {
 			r := recs[i]
 			b := make([]byte, 0, 32+12*len(r.ProviderASNs))
 			b = fmt.Appendf(b, `{ "customer": "AS%d", "providers": [`, r.CustomerASN)
@@ -90,8 +90,10 @@ func Write(w io.Writer, md Metadata, vrps []types.VRP, aspas []types.ASPARecord)
 	return bw.Flush()
 }
 
-// writeList writes one member holding a list, one record a line.
-func writeList(w *bufio.Writer, name string, n int, last bool, item func(int) string) {
+// WriteList writes one member of a JSON object holding a list, one record a
+// line: name, then the n records item returns. last says that no member
+// follows it.
+func WriteList(w *bufio.Writer, name string, n int, last bool, item func(int) string) {
 	end := ","
 	if last {
 		end = ""

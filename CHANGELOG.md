@@ -5,6 +5,19 @@ All notable changes to RAVEN are recorded here.
 ## Unreleased
 
 ### Added
+- `raven rtr monitor --divergence-dir <dir>` writes every item a cache
+  disagrees with the other caches on to a JSON file in that directory, where
+  a `divergence` record names at most 20: when a divergence episode opens,
+  when a cache returns to earlier data (`data_regressed`), and for every
+  compared cache each time the monitor gets SIGUSR1. The items are in the
+  format of the record's samples, each with `first_seen` and `settled`, one
+  a line, after a metadata block; differences still inside the settle window
+  are listed too. The files are written by a goroutine of their own, so a
+  slow disk does not hold an RTR session up, and a file that cannot be
+  written is a warning. The `divergence` record gains `items_file`, the
+  file's name: additive to NDJSON schema version 1. SIGUSR1 used to end the
+  monitor (Go's default); it no longer does, and without `--divergence-dir`
+  or with one cache it is answered with a log line.
 - `raven rtr dump` writes the VRPs and ASPAs that an RTR cache serves at its first complete sync as JSON, in the layout of Routinator's `json` output, sorted and without duplicates, so that two caches compare with a plain diff. The metadata has the cache, the session ID, the serial, the RTR version, the time and the `data_fingerprint` of the monitor's telemetry; below RTR version 2 the `aspas` list is left out and the metadata says that ASPAs were unavailable.
 
 ### Changed

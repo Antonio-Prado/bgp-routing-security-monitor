@@ -17,8 +17,8 @@ func TestCrossCacheSettleWindow(t *testing.T) {
 	cc := NewCrossCache(nil, 0, nil, nil)
 	a, _ := cc.Add("a", store.NewVRPStore(), store.NewASPAStore())
 	b, _ := cc.Add("b", store.NewVRPStore(), store.NewASPAStore())
-	a.Synced(2)
-	b.Synced(2)
+	a.Synced(2, "")
+	b.Synced(2, "")
 	sync := func(cache string, interval time.Duration) {
 		cc.ObserveSync(SessionEvent{Cache: cache, EventType: EventSync, IntervalSince: interval}, nil)
 	}
@@ -44,7 +44,7 @@ func TestCrossCacheSettleWindow(t *testing.T) {
 	// A cache out of the comparison does not count.
 	b.Disconnected()
 	c, _ := cc.Add("c", store.NewVRPStore(), store.NewASPAStore())
-	c.Synced(2)
+	c.Synced(2, "")
 	sync("c", time.Minute)
 	if got := cc.Settle(); got != SettleFloor {
 		t.Errorf("b disconnected: settle %v, want %v", got, SettleFloor)

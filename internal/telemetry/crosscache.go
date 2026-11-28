@@ -143,6 +143,11 @@ type CrossCacheMember struct {
 
 	inSession bool  // connected, and completed a sync in this session
 	version   uint8 // the session's RTR version
+	// fingerprint is the cache's data_fingerprint as of its last sync
+	// callback; pendingList, if not empty, the reason of a list to make at
+	// the next (ListAtSync).
+	fingerprint string
+	pendingList string
 
 	intervals []time.Duration // recent interval_since, oldest first
 
@@ -248,6 +253,8 @@ type CrossCache struct {
 	gauge  func(cache, kind string, n int)
 	// compared, if set, is told when a cache joins or leaves the comparison.
 	compared func(cache string, compared bool)
+	// list, if set, is handed every list of differences (OnList).
+	list func(*DivergenceList) string
 
 	members []*CrossCacheMember
 	byName  map[string]*CrossCacheMember
@@ -349,17 +356,27 @@ func (m *CrossCacheMember) Update(d *store.Delta, serial uint32) {
 }
 
 // Synced records a completed sync (End of Data) at RTR version version, and
-// compares the caches: the RTR client's sync callback.
-func (m *CrossCacheMember) Synced(version uint8) {
+// compares the caches: the RTR client's sync callback. fingerprint is the
+// data_fingerprint of the cache's data after the sync, as its sync record
+// carries it ("" when not known: ListAtSync then waits for the next sync).
+func (m *CrossCacheMember) Synced(version uint8, fingerprint string) {
 	c := m.cc
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	joined := !m.inSession
-	m.inSession, m.version = true, version
+	m.inSession, m.version, m.fingerprint = true, version, fingerprint
 	if joined && c.compared != nil {
 		c.compared(m.name, true)
 	}
 	c.compare()
+	if reason := m.pendingList; reason != "" {
+		m.pendingList = ""
+		if c.list != nil {
+			if l := c.listLocked(m, reason, nil); l != nil {
+				c.list(l)
+			}
+		}
+	}
 }
 
 // Disconnected takes the member out of the comparison until its next
@@ -510,11 +527,7 @@ func (c *CrossCache) compare() {
 		return
 	}
 	now := c.now()
-	if c.dirty || all != c.lastMembers || v2 != c.lastV2s {
-		c.diffVRPs(members, all, now)
-		c.diffASPAs(members, v2, now)
-		c.dirty, c.lastMembers, c.lastV2s = false, all, v2
-	}
+	c.diffLocked(members, all, v2, now)
 	settle := c.settleLocked(members)
 
 	// Per compared cache: persistent items per kind, whether any difference
@@ -565,7 +578,7 @@ func (c *CrossCache) compare() {
 		case m.episode == nil && total > 0:
 			m.episodes++
 			m.episode = &ccEpisode{n: m.episodes, started: x.first}
-			c.emitDivergence(m, members, all, settle, now, x.counts)
+			c.emitDivergence(m, all, settle, now, x.counts)
 		case m.episode != nil && !x.any:
 			c.emitResolved(m, all, now)
 			m.episode = nil
@@ -578,6 +591,16 @@ func (c *CrossCache) compare() {
 				}
 			}
 		}
+	}
+}
+
+// diffLocked brings the differences between members up to date, when a
+// cache's data or the compared caches changed since it last ran.
+func (c *CrossCache) diffLocked(members []*CrossCacheMember, all, v2 uint64, now time.Time) {
+	if c.dirty || all != c.lastMembers || v2 != c.lastV2s {
+		c.diffVRPs(members, all, now)
+		c.diffASPAs(members, v2, now)
+		c.dirty, c.lastMembers, c.lastV2s = false, all, v2
 	}
 }
 
@@ -751,12 +774,6 @@ type DivergenceSample struct {
 	// included), Disagree the others.
 	Agree    []string `json:"agree"`
 	Disagree []string `json:"disagree"`
-
-	order   int
-	vrp     vrpKey
-	isASPA  bool
-	cust    uint32
-	against uint64 // Disagree as a mask
 }
 
 type divergenceRecord struct {
@@ -771,6 +788,9 @@ type divergenceRecord struct {
 	Counts        map[string]int     `json:"counts"`
 	Samples       []DivergenceSample `json:"samples"`
 	SplitWith     []string           `json:"split_with,omitempty"`
+	// ItemsFile names the file that lists every difference, where one was
+	// written (OnList).
+	ItemsFile string `json:"items_file,omitempty"`
 }
 
 type divergenceResolvedRecord struct {
@@ -786,76 +806,23 @@ type divergenceResolvedRecord struct {
 
 func kindOrder(kind string) int { return slices.Index(DivergenceKinds, kind) }
 
-func (c *CrossCache) emitDivergence(m *CrossCacheMember, members []*CrossCacheMember, all uint64, settle time.Duration, now time.Time, counts map[string]int) {
-	persistent := func(first time.Time) bool { return now.Sub(first) > settle }
-	var samples []DivergenceSample
+func (c *CrossCache) emitDivergence(m *CrossCacheMember, all uint64, settle time.Duration, now time.Time, counts map[string]int) {
+	items := c.differencesLocked(m, all, settle, now)
+	var settled []ccItem
 	var splitWith uint64
-	for k, d := range c.vrpDiffs {
-		mask, kind := d.attribution()
-		if mask&m.bit == 0 || !persistent(d.first) {
+	for _, it := range items {
+		if !it.settled {
 			continue
 		}
-		same := d.holders
-		if d.holders&m.bit == 0 {
-			same = all &^ d.holders
+		if kind := DivergenceKinds[it.order]; kind == DivergenceVRPSplit || kind == DivergenceASPASplit {
+			splitWith |= it.against
 		}
-		if kind == DivergenceVRPSplit {
-			splitWith |= all &^ same
-		}
-		samples = append(samples, DivergenceSample{Kind: kind, order: kindOrder(kind), vrp: k, against: all &^ same})
+		settled = append(settled, it)
 	}
-	for cust, d := range c.aspaDiffs {
-		if !persistent(d.first) {
-			continue
-		}
-		for _, a := range d.attribution() {
-			if a.mask&m.bit == 0 {
-				continue
-			}
-			var same uint64
-			for _, g := range d.groups {
-				if g.mask&m.bit != 0 {
-					same = g.mask
-				}
-			}
-			if a.kind == DivergenceASPASplit {
-				splitWith |= d.members &^ same
-			}
-			s := DivergenceSample{Kind: a.kind, order: kindOrder(a.kind), isASPA: true, cust: cust, against: d.members &^ same}
-			s.Providers = slices.Clone(m.aspas[cust])
-			if maj := d.majority(); maj >= 0 && len(d.groups[maj].providers) > 0 {
-				s.MajorityProviders = slices.Clone(d.groups[maj].providers)
-			}
-			samples = append(samples, s)
-		}
-	}
-	slices.SortFunc(samples, func(a, b DivergenceSample) int {
-		if a.order != b.order {
-			return cmp.Compare(a.order, b.order)
-		}
-		if a.isASPA {
-			return cmp.Compare(a.cust, b.cust)
-		}
-		return compareVRPKeys(a.vrp, b.vrp)
-	})
-	samples = pickSamples(samples, func(s DivergenceSample) int { return s.order })
-	for i := range samples {
-		s := &samples[i]
-		if s.isASPA {
-			cust := s.cust
-			s.CustomerASN = &cust
-		} else {
-			maxLen, asn := s.vrp.maxLen, s.vrp.asn
-			s.Prefix, s.MaxLength, s.ASN = s.vrp.prefix().String(), &maxLen, &asn
-		}
-		members := all
-		if s.isASPA {
-			members = c.aspaDiffs[s.cust].members
-		}
-		s.Agree, s.Disagree = c.names(members&^s.against), c.names(s.against)
-	}
-	if samples == nil {
-		samples = []DivergenceSample{}
+	settled = pickSamples(settled, func(it ccItem) int { return it.order })
+	samples := make([]DivergenceSample, 0, len(settled))
+	for i := range settled {
+		samples = append(samples, settled[i].sample(c.names))
 	}
 	rec := divergenceRecord{
 		Timestamp: now.UTC(), Cache: m.name, EventType: "divergence", SchemaVersion: NDJSONSchemaVersion,
@@ -865,8 +832,14 @@ func (c *CrossCache) emitDivergence(m *CrossCacheMember, members []*CrossCacheMe
 	if splitWith != 0 {
 		rec.SplitWith = c.names(splitWith)
 	}
+	if c.list != nil {
+		// Every item, where the record has room for a sample of them.
+		if l := c.listLocked(m, ListOnDivergence, items); l != nil {
+			rec.ItemsFile = c.list(l)
+		}
+	}
 	c.log.Warn("RTR cache diverges from the other caches", "cache", m.name, "episode", m.episode.n,
-		"counts", counts, "since", m.episode.started, "split_with", rec.SplitWith)
+		"counts", counts, "since", m.episode.started, "split_with", rec.SplitWith, "items_file", rec.ItemsFile)
 	c.rec.write(rec, m.name, rec.EventType)
 }
 

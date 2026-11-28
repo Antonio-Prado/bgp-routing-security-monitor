@@ -1385,7 +1385,10 @@ raven rtr monitor --cache routinator.example.net:3323 --cache fort.example.net:3
 Runs in the foreground until you press Ctrl+C, or until SIGTERM or SIGHUP (a
 closed terminal or SSH session, `tmux kill-session`). Each shuts it down the
 same way: a `disconnected` record (`shutdown`) per cache, and a final save of
-`--anomaly-snapshot`.
+`--anomaly-snapshot`. SIGUSR1 does not stop it: with several caches and
+`--divergence-dir` it writes what every compared cache disagrees with the
+others on at that moment (see *Comparing several caches* below); otherwise
+it logs that there is nothing to list.
 
 **Output:** the NDJSON written to `--log-file` is a versioned contract: every
 record type, field and value is documented in
@@ -1400,6 +1403,7 @@ the compatibility policy. Build parsers against that page.
 |---|---|---|
 | `--cache` | `localhost:3323` | RTR cache address. Repeat to monitor several caches in one process and compare them (see below); each gets its own session, data set, anomaly baseline and NDJSON records |
 | `--compare-settle` | `0` (automatic) | With several caches: how long a difference between them must last before it is reported. Automatic: twice the slowest cache's median refresh interval, at least `10m`, and `30m` until every cache's interval is known |
+| `--divergence-dir` | — | With several caches: directory (created if absent) where the full list of a cache's differences is written, one JSON file a list: when a divergence episode opens, when a cache returns to earlier data (`data_regressed`), and for every compared cache on SIGUSR1. Empty writes no files |
 | `--log-file` | `rtr-telemetry.ndjson` | Path to the NDJSON telemetry output file (created if absent, appended if present) |
 | `--transport` | `tcp` | RTR transport: `tcp` or `tls` |
 | `--rtr-version` | `auto` | RTR protocol version. `auto` starts at 2 and falls back one version at a time (2, 1, 0) when the cache rejects one with Error Report code 4 or closes the connection before answering; `0`, `1` or `2` pins the session to that version, with no fallback and no re-probe |
@@ -1483,6 +1487,17 @@ from a problem at one validator (stuck, behind, misconfigured):
   `divergence_resolved` when it agrees again. Caches below RTR version 2 are
   compared on VRPs only, and a disconnected cache is left out until it
   syncs again.
+- The record names at most 20 of the items, and only those that had settled
+  when the episode opened. With `--divergence-dir` the monitor also writes
+  **every item** to a file in that directory, in the format of the record's
+  samples, with when each difference was first seen and whether it has
+  settled: when the episode opens (the record names the file as
+  `items_file`), when a cache returns to earlier data (`data_regressed`),
+  and for every compared cache each time the monitor gets SIGUSR1
+  (`kill -USR1 <pid>`), which is how to list the items that began to differ
+  later in an episode. The NDJSON stream stays one short line a record
+  whatever the size of the incident. See
+  [Divergence files](../reference/telemetry-ndjson.md#divergence-files).
 - The same large change (one that trips the anomaly detector) at every
   cache within the settle window is one `upstream_change` record, alongside
   each cache's `anomaly`. A large change at one cache only is never called

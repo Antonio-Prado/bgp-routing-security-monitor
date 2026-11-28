@@ -101,7 +101,17 @@ func handleRTREvent(rec *telemetry.Recorder, detector *telemetry.Detector, cmp *
 	if cmp != nil {
 		cmp.ObserveSync(ev, anomaly)
 	}
-	recordDataEvents(rec, detector.Data(), detector.Data().Observe(ev), ev.Timestamp, log)
+	des := detector.Data().Observe(ev)
+	recordDataEvents(rec, detector.Data(), des, ev.Timestamp, log)
+	if cmp != nil {
+		for _, de := range des {
+			if de.Kind == telemetry.DataRegressed {
+				// What the cache now disagrees with the others on, as of
+				// this sync (--divergence-dir).
+				cmp.ListAtSync(de.Cache, telemetry.ListOnDataRegressed, ev.DataFingerprint)
+			}
+		}
+	}
 	return ok
 }
 
@@ -218,7 +228,7 @@ func newMonitorSet(caches []string, transport, rtrVersion string, settle time.Du
 				return nil, fmt.Errorf("--cache: %w", err)
 			}
 			client.SetOnUpdate(func(d *store.Delta) { member.Update(d, client.Serial()) })
-			client.SetOnSync(func() { member.Synced(client.ProtocolVersion()) })
+			client.SetOnSync(func() { member.Synced(client.ProtocolVersion(), client.DataFingerprint().String()) })
 			client.SetOnDisconnect(func(telemetry.DisconnectReason) { member.Disconnected() })
 			for _, kind := range telemetry.DivergenceKinds {
 				metrics.RTRDivergentItems.WithLabelValues(cache, kind).Set(0)
@@ -270,6 +280,7 @@ func newRTRMonitorCmd() *cobra.Command {
 	var (
 		caches          []string
 		compareSettle   time.Duration
+		divergenceDir   string
 		logFile         string
 		transport       string
 		prometheus      string
@@ -292,7 +303,13 @@ returns to data it served earlier (data_regressed).
 
 With several caches it also compares their data after every sync, and reports
 a cache that persistently disagrees with the others (divergence) and a large
-change that reached every cache at once (upstream_change).`,
+change that reached every cache at once (upstream_change).
+
+A divergence record names at most 20 of the items a cache disagrees on. With
+--divergence-dir the monitor also writes all of them to a file in that
+directory, one file a cache: when a divergence episode opens (the record
+names the file as items_file), when a cache returns to earlier data
+(data_regressed) and, for every compared cache, each time it gets SIGUSR1.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			log := initLogger()
 
@@ -343,6 +360,20 @@ change that reached every cache at once (upstream_change).`,
 				initAnomalyMetrics(cache)
 			}
 			configureDataTracker(detector.Data(), staleThreshold, set.cmp)
+
+			// The full lists of differences, beside the NDJSON stream.
+			var divFiles *divergenceFiles
+			switch {
+			case divergenceDir == "":
+			case set.cmp == nil:
+				log.Warn("--divergence-dir needs several caches to compare: nothing will be written there", "dir", divergenceDir)
+			default:
+				if divFiles, err = newDivergenceFiles(expandHome(divergenceDir), log); err != nil {
+					f.Close()
+					return err
+				}
+				set.cmp.OnList(divFiles.accept)
+			}
 			seedFromLog(detector, logFile, caches, log)
 
 			// Consume the telemetry event channel: feed sync/structural events to
@@ -375,7 +406,19 @@ change that reached every cache at once (upstream_change).`,
 				startRTRMonitorMetrics(ctx, prometheus, log)
 			}
 
+			// SIGUSR1: the differences of every compared cache, now. Asked
+			// for before the sessions start, so that it never ends a
+			// monitor that is running them.
+			listSignal, stopListSignal := watchListSignals()
+			defer stopListSignal()
+
 			done := set.start(ctx)
+
+			listsDone := make(chan struct{})
+			go func() {
+				defer close(listsDone)
+				listOnSignal(ctx, listSignal, set.cmp, divFiles != nil, log)
+			}()
 
 			// Data age between syncs. Stopped, like the clients, before the
 			// recorder closes and the log file with it.
@@ -419,6 +462,12 @@ change that reached every cache at once (upstream_change).`,
 				log.Warn("final anomaly baseline save failed", "path", snapshotPath, "error", err)
 			}
 
+			// Nothing makes a list any more: write those still waiting.
+			<-listsDone
+			if divFiles != nil {
+				divFiles.close()
+			}
+
 			if err := f.Close(); err != nil {
 				return fmt.Errorf("close log file: %w", err)
 			}
@@ -430,6 +479,8 @@ change that reached every cache at once (upstream_change).`,
 		"RTR cache address; repeat to monitor and compare several caches in one process")
 	cmd.Flags().DurationVar(&compareSettle, "compare-settle", 0,
 		"with several caches: how long a difference between them must last to be reported (0: twice the slowest cache's median refresh interval, at least 10m; 30m until intervals are known)")
+	cmd.Flags().StringVar(&divergenceDir, "divergence-dir", "",
+		"with several caches: directory to write the full list of a cache's differences to, when a divergence episode opens, on data_regressed and on SIGUSR1 (empty: no files)")
 	cmd.Flags().StringVar(&logFile, "log-file", "rtr-telemetry.ndjson", "path to NDJSON telemetry output file")
 	cmd.Flags().StringVar(&transport, "transport", "tcp", "RTR transport: tcp or tls")
 	cmd.Flags().StringVar(&prometheus, "prometheus", "", "Prometheus listen address (e.g. :9595); empty disables metrics")
